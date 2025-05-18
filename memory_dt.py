@@ -10,6 +10,7 @@ import gymnasium as gym
 from pomdp_envs.velocity_cartpole import VelocityCartPoleEnv
 from pomdp_envs.flickering_pendulum import FlickeringPendulumEnv
 from pomdp_envs.lidar_mountain_car import LiDARMountainCarEnv
+import pandas as pd
 
 import matplotlib.pyplot as plt
 
@@ -130,11 +131,25 @@ class MemoryDecisionTransformer(nn.Module):
         
         # Memory module (optional)
         if memory_type == 'gru':
-            # TODO: Implement GRU memory
+            self.memory = nn.GRU(
+                input_size=n_embed,
+                hidden_size=memory_dim,
+                batch_first=True,
+            )
             self.memory_proj = nn.Linear(memory_dim, n_embed)
         elif memory_type == 'lstm':
-            # TODO: Implement LSTM memory
+            self.memory = nn.LSTM(
+                input_size=n_embed,
+                hidden_size=memory_dim,
+                batch_first=True,
+            )
             self.memory_proj = nn.Linear(memory_dim, n_embed)
+        elif memory_type == 'token':
+            # self.num_mem_tokens = memory_dim
+            self.num_mem_tokens = 1
+            # self.memory_tokens = nn.Parameter(torch.randn(self.num_mem_tokens, n_embed))
+            self.memory_tokens = nn.Parameter(torch.zeros(self.num_mem_tokens, n_embed))
+            self.memory = None
         else:
             self.memory = None
         
@@ -185,12 +200,16 @@ class MemoryDecisionTransformer(nn.Module):
         if self.memory is not None:
             if self.memory_type == 'gru':
                 if self.hidden_state is None:
-                    # TODO: Implement GRU memory
+                    self.hidden_state = torch.zeros(
+                        1, batch_size, self.memory.hidden_size, device=states.device
+                    )
                 
                 memory_out, self.hidden_state = self.memory(state_embeddings, self.hidden_state)
             elif self.memory_type == 'lstm':
                 if self.hidden_state is None:
-                    # TODO: Implement LSTM memory
+                    h0 = torch.zeros(1, batch_size, self.memory.hidden_size, device=states.device)
+                    c0 = torch.zeros(1, batch_size, self.memory.hidden_size, device=states.device)
+                    self.hidden_state = (h0, c0)
                 
                 memory_out, self.hidden_state = self.memory(state_embeddings, self.hidden_state)
             
@@ -199,6 +218,46 @@ class MemoryDecisionTransformer(nn.Module):
             
             # combine memory with state embeddings
             state_embeddings = state_embeddings + memory_embedding
+        
+        if self.memory_type == "token":
+            device = states.device
+            if self.hidden_state is None:
+                mem = self.memory_tokens.unsqueeze(0).expand(batch_size, self.num_mem_tokens, -1)
+                # mem = torch.zeros(self.num_mem_tokens, self.n_embed).unsqueeze(0).expand(batch_size, self.num_mem_tokens, -1).to(device)
+            else:
+                mem = self.hidden_state
+            outs = []
+            for t in range(seq_length): # auto-regressive approach for memory tokens (manually, instead of gru/lstm)
+                r_t = return_embeddings[:, t:t+1]
+                o_t = state_embeddings[:, t:t+1]
+                a_t = action_embeddings[:, t:t+1]
+                x = torch.cat([mem, r_t, o_t, a_t], dim=1)
+                T = self.num_mem_tokens + 3
+                mask = torch.triu(torch.ones((T, T), device=device).bool(), diagonal=1)
+                mask[:self.num_mem_tokens, :] = False
+                mask[:, :self.num_mem_tokens] = False
+
+                x = self.transformer(x, mask=mask)
+                # x = self.transformer.layers[0](x, src_mask=mask)
+
+                # try:
+                #     for layer in self.transformer.layers:
+                #         x = layer(x, mask=mask)
+                # except TypeError:
+                #     try:
+                #         for layer in self.transformer.layers:
+                #             x = layer(x, src_mask=mask)
+                #     except TypeError:
+                #         # fall back to no mask if neither works
+                #         for layer in self.transformer.layers:
+                #             x = layer(x)
+                
+                mem = x[:, :self.num_mem_tokens]
+                outs.append(x[:, self.num_mem_tokens+1:self.num_mem_tokens+2])
+            all_states = torch.cat(outs, dim=1)
+            self.hidden_state = mem
+            return self.action_head(all_states)
+
         
         # prepare sequence for transformer (R_t, o_t, a_t)
         sequence = torch.cat([
@@ -545,7 +604,7 @@ def train_memory_dt(
     
     # save best model
     os.makedirs('models', exist_ok=True)
-    best_model_path = f"models/memory_dt_{env_name}_{memory_type}_best.pt"
+    best_model_path = f"models/memory_dt_{env_name}_{memory_type}_{n_layer}_best.pt"
     torch.save(best_model_state if best_model_state else model.state_dict(), best_model_path)
     print(f"Best model saved to {best_model_path}")
     
@@ -568,9 +627,16 @@ def train_memory_dt(
     plt.title('Validation Returns')
     plt.xlabel('Epoch')
     plt.ylabel('Mean Return')
+
+    data = pd.DataFrame({
+        'train_loss': train_losses,
+        'val_loss': val_losses,
+        'val_returns': val_returns
+    })
+    data.to_csv(f"models/memory_dt_{env_name}_{memory_type}_{n_layer}_training.csv", index=False)
     
     plt.tight_layout()
-    plt.savefig(f"models/memory_dt_{env_name}_{memory_type}_training.png")
+    plt.savefig(f"models/memory_dt_{env_name}_{memory_type}_{n_layer}_training.png")
     plt.close()
     
     return model, train_losses, val_returns

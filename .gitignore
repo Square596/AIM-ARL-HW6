@@ -1,4 +1,5 @@
-models/
+models/*.pt
+models/*.png
 pomdp_datasets/
 __pycache__/
 *.pyc
